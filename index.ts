@@ -1,6 +1,8 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { homedir } from "node:os";
+import { spawn } from "node:child_process";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
@@ -202,6 +204,64 @@ function guessMediaType(path: string): string | undefined {
 
 function isImageMimeType(mimeType: string | undefined): boolean {
 	return mimeType?.toLowerCase().startsWith("image/") ?? false;
+}
+
+async function preprocessMarkdown(text: string): Promise<string> {
+	const TIMEOUT_MS = 5000;
+
+	return new Promise((resolve) => {
+		// Get script path relative to this module's location
+		const scriptDir = join(fileURLToPath(import.meta.url), "..");
+		const scriptPath = join(scriptDir, "telegram-markdown.py");
+		// Use uv run since the script requires dependencies from uv's virtual environment
+		const proc = spawn("uv", ["run", "--script", scriptPath], { shell: false });
+
+		let stdout = "";
+		let stderr = "";
+		let resolved = false;
+
+		const doResolve = (result: string): void => {
+			if (resolved) return;
+			resolved = true;
+			proc.kill();
+			resolve(result);
+		};
+
+		// Timeout wrapper
+		const timeout = setTimeout(() => {
+			doResolve(text);
+		}, TIMEOUT_MS);
+
+		proc.on("error", (err) => {
+			clearTimeout(timeout);
+			console.error("[telegram-markdown] spawn error:", err.message);
+			doResolve(text);
+		});
+
+		proc.stdout.on("data", (data) => {
+			stdout += data.toString();
+		});
+
+		proc.stderr.on("data", (data) => {
+			stderr += data.toString();
+		});
+
+		proc.on("close", (code) => {
+			clearTimeout(timeout);
+			if (code === 0 && stdout) {
+				doResolve(stdout);
+			} else {
+				if (stderr) {
+					console.error("[telegram-markdown] conversion error:", stderr);
+				}
+				// Fall back to original text if conversion fails
+				doResolve(text);
+			}
+		});
+
+		proc.stdin.write(text);
+		proc.stdin.end();
+	});
 }
 
 function formatTokens(count: number): string {
@@ -453,12 +513,13 @@ export default function (pi: ExtensionAPI) {
 		const text = state.pendingText.trim();
 		if (!text || text === state.lastSentText) return;
 		const truncated = text.length > MAX_MESSAGE_LENGTH ? text.slice(0, MAX_MESSAGE_LENGTH) : text;
+		const preprocessed = await preprocessMarkdown(truncated);
 
 		if (draftSupport !== "unsupported") {
 			const draftId = state.draftId ?? allocateDraftId();
 			state.draftId = draftId;
 			try {
-				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: truncated });
+				await callTelegram("sendMessageDraft", { chat_id: chatId, draft_id: draftId, text: preprocessed });
 				draftSupport = "supported";
 				state.mode = "draft";
 				state.lastSentText = truncated;
@@ -469,13 +530,13 @@ export default function (pi: ExtensionAPI) {
 		}
 
 		if (state.messageId === undefined) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: truncated });
+			const sent = await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: preprocessed, parse_mode: "MarkdownV2" });
 			state.messageId = sent.message_id;
 			state.mode = "message";
 			state.lastSentText = truncated;
 			return;
 		}
-		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: truncated });
+		await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: preprocessed, parse_mode: "MarkdownV2" });
 		state.mode = "message";
 		state.lastSentText = truncated;
 	}
@@ -496,22 +557,25 @@ export default function (pi: ExtensionAPI) {
 			await clearPreview(chatId);
 			return false;
 		}
+		// In draft mode, flushPreview already sent the final text, so we're done
 		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
 			await clearPreview(chatId);
 			return true;
 		}
+		// In message mode, the text was already sent via editMessageText in flushPreview
 		previewState = undefined;
 		return state.messageId !== undefined;
 	}
 
 	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
-		const chunks = chunkParagraphs(text);
+		const preprocessed = await preprocessMarkdown(text);
+		const chunks = chunkParagraphs(preprocessed);
 		let lastMessageId: number | undefined;
 		for (const chunk of chunks) {
 			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
 				chat_id: chatId,
 				text: chunk,
+				parse_mode: "MarkdownV2",
 			});
 			lastMessageId = sent.message_id;
 		}
