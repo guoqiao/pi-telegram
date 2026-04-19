@@ -497,39 +497,67 @@ export default function (pi: ExtensionAPI) {
 			await clearPreview(chatId);
 			return false;
 		}
-		const converted = convertMarkdownV2(finalText);
+		const converted = tryConvertMarkdownV2(finalText);
 		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: converted, parse_mode: "MarkdownV2" });
+			if (converted) {
+				try {
+					await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: converted, parse_mode: "MarkdownV2" });
+				} catch {
+					await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+				}
+			} else {
+				await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+			}
 			await clearPreview(chatId);
 			return true;
 		}
 		if (state.messageId !== undefined) {
-			await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: converted, parse_mode: "MarkdownV2" });
+			if (converted) {
+				try {
+					await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: converted, parse_mode: "MarkdownV2" });
+				} catch {
+					await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: finalText });
+				}
+			} else {
+				await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: finalText });
+			}
 		}
 		previewState = undefined;
 		return state.messageId !== undefined;
 	}
 
-	function convertMarkdownV2(text: string): string {
+	function tryConvertMarkdownV2(text: string): string | undefined {
 		try {
 			return telegramifyMarkdown(text, "escape");
 		} catch {
-			// If conversion fails, return the original text
-			return text;
+			return undefined;
 		}
 	}
 
 	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
-		const converted = convertMarkdownV2(text);
-		const chunks = chunkParagraphs(converted);
+		const converted = tryConvertMarkdownV2(text);
+		const chunks = chunkParagraphs(converted ?? text);
 		let lastMessageId: number | undefined;
 		for (const chunk of chunks) {
-			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-				chat_id: chatId,
-				text: chunk,
-				parse_mode: "MarkdownV2",
-			});
-			lastMessageId = sent.message_id;
+			try {
+				const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+					chat_id: chatId,
+					text: chunk,
+					...(converted ? { parse_mode: "MarkdownV2" } : {}),
+				});
+				lastMessageId = sent.message_id;
+			} catch {
+				// MarkdownV2 rejected by Telegram, resend this chunk as plain text
+				const plainChunks = chunkParagraphs(text);
+				for (const plainChunk of plainChunks) {
+					const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
+						chat_id: chatId,
+						text: plainChunk,
+					});
+					lastMessageId = sent.message_id;
+				}
+				return lastMessageId;
+			}
 		}
 		return lastMessageId;
 	}
