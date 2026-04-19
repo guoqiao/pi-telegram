@@ -1,6 +1,7 @@
 import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
+import telegramifyMarkdown from "telegramify-markdown";
 
 import type { ImageContent, TextContent } from "@mariozechner/pi-ai";
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
@@ -496,22 +497,37 @@ export default function (pi: ExtensionAPI) {
 			await clearPreview(chatId);
 			return false;
 		}
+		const converted = convertMarkdownV2(finalText);
 		if (state.mode === "draft") {
-			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
+			await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: converted, parse_mode: "MarkdownV2" });
 			await clearPreview(chatId);
 			return true;
+		}
+		if (state.messageId !== undefined) {
+			await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: converted, parse_mode: "MarkdownV2" });
 		}
 		previewState = undefined;
 		return state.messageId !== undefined;
 	}
 
+	function convertMarkdownV2(text: string): string {
+		try {
+			return telegramifyMarkdown(text, "escape");
+		} catch {
+			// If conversion fails, return the original text
+			return text;
+		}
+	}
+
 	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
-		const chunks = chunkParagraphs(text);
+		const converted = convertMarkdownV2(text);
+		const chunks = chunkParagraphs(converted);
 		let lastMessageId: number | undefined;
 		for (const chunk of chunks) {
 			const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
 				chat_id: chatId,
 				text: chunk,
+				parse_mode: "MarkdownV2",
 			});
 			lastMessageId = sent.message_id;
 		}
