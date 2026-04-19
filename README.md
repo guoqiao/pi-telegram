@@ -11,13 +11,21 @@ Telegram DM bridge for pi.
 From git:
 
 ```bash
-pi install git:github.com/badlogic/pi-telegram
+pi install git:github.com/guoqiao/pi-telegram
 ```
 
 Or for a single run:
 
 ```bash
-pi -e git:github.com/badlogic/pi-telegram
+pi -e git:github.com/guoqiao/pi-telegram
+```
+
+Uninstall:
+```
+vim ~/.pi/agent/settings.json
+# rm pi-telegram in above config
+# then rm on disk
+rm -rf ~/.pi/agent/git/github.com/guoqiao/pi-telegram/
 ```
 
 ## Configure
