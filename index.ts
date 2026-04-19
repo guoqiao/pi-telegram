@@ -488,6 +488,29 @@ export default function (pi: ExtensionAPI) {
 		}, PREVIEW_THROTTLE_MS);
 	}
 
+	async function sendMarkdownV2WithFallback(
+		method: "sendMessage" | "editMessageText",
+		baseParams: Record<string, unknown>,
+		text: string,
+	): Promise<TelegramSentMessage | undefined> {
+		// Try converting and sending as MarkdownV2
+		let converted: string | undefined;
+		try {
+			converted = telegramifyMarkdown(text, "escape");
+		} catch {
+			// conversion failed, skip MarkdownV2 attempt
+		}
+		if (converted) {
+			try {
+				return await callTelegram<TelegramSentMessage>(method, { ...baseParams, text: converted, parse_mode: "MarkdownV2" });
+			} catch {
+				// Telegram rejected MarkdownV2, fall through to plain text
+			}
+		}
+		// Fallback: send as plain text
+		return await callTelegram<TelegramSentMessage>(method, { ...baseParams, text });
+	}
+
 	async function finalizePreview(chatId: number): Promise<boolean> {
 		const state = previewState;
 		if (!state) return false;
@@ -497,67 +520,24 @@ export default function (pi: ExtensionAPI) {
 			await clearPreview(chatId);
 			return false;
 		}
-		const converted = tryConvertMarkdownV2(finalText);
 		if (state.mode === "draft") {
-			if (converted) {
-				try {
-					await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: converted, parse_mode: "MarkdownV2" });
-				} catch {
-					await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
-				}
-			} else {
-				await callTelegram<TelegramSentMessage>("sendMessage", { chat_id: chatId, text: finalText });
-			}
+			await sendMarkdownV2WithFallback("sendMessage", { chat_id: chatId }, finalText);
 			await clearPreview(chatId);
 			return true;
 		}
 		if (state.messageId !== undefined) {
-			if (converted) {
-				try {
-					await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: converted, parse_mode: "MarkdownV2" });
-				} catch {
-					await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: finalText });
-				}
-			} else {
-				await callTelegram("editMessageText", { chat_id: chatId, message_id: state.messageId, text: finalText });
-			}
+			await sendMarkdownV2WithFallback("editMessageText", { chat_id: chatId, message_id: state.messageId }, finalText);
 		}
 		previewState = undefined;
 		return state.messageId !== undefined;
 	}
 
-	function tryConvertMarkdownV2(text: string): string | undefined {
-		try {
-			return telegramifyMarkdown(text, "escape");
-		} catch {
-			return undefined;
-		}
-	}
-
 	async function sendTextReply(chatId: number, _replyToMessageId: number, text: string): Promise<number | undefined> {
-		const converted = tryConvertMarkdownV2(text);
-		const chunks = chunkParagraphs(converted ?? text);
+		const chunks = chunkParagraphs(text);
 		let lastMessageId: number | undefined;
 		for (const chunk of chunks) {
-			try {
-				const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-					chat_id: chatId,
-					text: chunk,
-					...(converted ? { parse_mode: "MarkdownV2" } : {}),
-				});
-				lastMessageId = sent.message_id;
-			} catch {
-				// MarkdownV2 rejected by Telegram, resend this chunk as plain text
-				const plainChunks = chunkParagraphs(text);
-				for (const plainChunk of plainChunks) {
-					const sent = await callTelegram<TelegramSentMessage>("sendMessage", {
-						chat_id: chatId,
-						text: plainChunk,
-					});
-					lastMessageId = sent.message_id;
-				}
-				return lastMessageId;
-			}
+			const sent = await sendMarkdownV2WithFallback("sendMessage", { chat_id: chatId }, chunk);
+			if (sent) lastMessageId = sent.message_id;
 		}
 		return lastMessageId;
 	}
