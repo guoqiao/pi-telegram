@@ -1,4 +1,4 @@
-import { mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, stat, unlink, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import { homedir } from "node:os";
 import telegramifyMarkdown from "telegramify-markdown";
@@ -13,6 +13,7 @@ interface TelegramConfig {
 	botUsername?: string;
 	botId?: number;
 	allowedUserId?: number;
+	allowedChatId?: number;
 	lastUpdateId?: number;
 }
 
@@ -21,6 +22,17 @@ interface TelegramApiResponse<T> {
 	result?: T;
 	description?: string;
 	error_code?: number;
+}
+
+class TelegramApiError extends Error {
+	constructor(
+		message: string,
+		readonly method: string,
+		readonly errorCode?: number,
+	) {
+		super(message);
+		this.name = "TelegramApiError";
+	}
 }
 
 interface TelegramUser {
@@ -154,6 +166,7 @@ interface TelegramMediaGroupState {
 
 const CONFIG_PATH = join(homedir(), ".pi", "agent", "telegram.json");
 const TEMP_DIR = join(homedir(), ".pi", "agent", "tmp", "telegram");
+const LOCK_PATH = join(homedir(), ".pi", "agent", "tmp", "telegram", "poller.lock");
 const TELEGRAM_PREFIX = "[telegram]";
 const MAX_MESSAGE_LENGTH = 4096;
 const MAX_ATTACHMENTS_PER_TURN = 10;
@@ -285,6 +298,41 @@ async function writeConfig(config: TelegramConfig): Promise<void> {
 	await writeFile(CONFIG_PATH, JSON.stringify(config, null, "\t") + "\n", "utf8");
 }
 
+async function processIsRunning(pid: number): Promise<boolean> {
+	if (!Number.isInteger(pid) || pid <= 0) return false;
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		return code === "EPERM";
+	}
+}
+
+async function readLock(): Promise<{ pid?: number; startedAt?: number; cwd?: string } | undefined> {
+	try {
+		return JSON.parse(await readFile(LOCK_PATH, "utf8")) as { pid?: number; startedAt?: number; cwd?: string };
+	} catch {
+		return undefined;
+	}
+}
+
+async function writeLock(): Promise<void> {
+	await mkdir(TEMP_DIR, { recursive: true });
+	await writeFile(
+		LOCK_PATH,
+		JSON.stringify({ pid: process.pid, startedAt: Date.now(), cwd: process.cwd() }, null, "\t") + "\n",
+		"utf8",
+	);
+}
+
+async function clearLock(): Promise<void> {
+	const lock = await readLock();
+	if (!lock?.pid || lock.pid === process.pid || !(await processIsRunning(lock.pid))) {
+		await unlink(LOCK_PATH).catch(() => undefined);
+	}
+}
+
 export default function (pi: ExtensionAPI) {
 	let config: TelegramConfig = {};
 	let pollingController: AbortController | undefined;
@@ -332,6 +380,22 @@ export default function (pi: ExtensionAPI) {
 		ctx.ui.setStatus("telegram", `${label} ${theme.fg("success", "connected")}`);
 	}
 
+	function getNotifyChatId(): number | undefined {
+		return config.allowedChatId ?? config.allowedUserId;
+	}
+
+	async function sendConnectNotification(ctx: ExtensionContext): Promise<void> {
+		const chatId = getNotifyChatId();
+		if (!chatId || !config.botToken) return;
+
+		const lines = ["✅ pi Telegram bridge connected.", `cwd: ${ctx.cwd}`];
+		const sessionFile = ctx.sessionManager.getSessionFile();
+		if (sessionFile) lines.push(`session: ${sessionFile}`);
+		if (ctx.model) lines.push(`model: ${ctx.model.provider}/${ctx.model.id}`);
+
+		await sendTextReply(chatId, 0, lines.join("\n"));
+	}
+
 	async function callTelegram<TResponse>(
 		method: string,
 		body: Record<string, unknown>,
@@ -346,7 +410,7 @@ export default function (pi: ExtensionAPI) {
 		});
 			const data = (await response.json()) as TelegramApiResponse<TResponse>;
 		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
+			throw new TelegramApiError(data.description || `Telegram API ${method} failed`, method, data.error_code);
 		}
 		return data.result;
 	}
@@ -373,7 +437,7 @@ export default function (pi: ExtensionAPI) {
 		});
 		const data = (await response.json()) as TelegramApiResponse<TResponse>;
 		if (!data.ok || data.result === undefined) {
-			throw new Error(data.description || `Telegram API ${method} failed`);
+			throw new TelegramApiError(data.description || `Telegram API ${method} failed`, method, data.error_code);
 		}
 		return data.result;
 	}
@@ -852,6 +916,7 @@ export default function (pi: ExtensionAPI) {
 			);
 			if (config.allowedUserId === undefined && firstMessage.from) {
 				config.allowedUserId = firstMessage.from.id;
+				config.allowedChatId = firstMessage.chat.id;
 				await writeConfig(config);
 				updateStatus(ctx);
 			}
@@ -894,6 +959,7 @@ export default function (pi: ExtensionAPI) {
 
 		if (config.allowedUserId === undefined) {
 			config.allowedUserId = message.from.id;
+			config.allowedChatId = message.chat.id;
 			await writeConfig(config);
 			updateStatus(ctx);
 			await sendTextReply(message.chat.id, message.message_id, "Telegram bridge paired with this account.");
@@ -904,11 +970,22 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 
+		if (config.allowedChatId !== message.chat.id) {
+			config.allowedChatId = message.chat.id;
+			await writeConfig(config);
+		}
+
 		await handleAuthorizedTelegramMessage(message, ctx);
 	}
 
 	async function pollLoop(ctx: ExtensionContext, signal: AbortSignal): Promise<void> {
 		if (!config.botToken) return;
+
+		const lock = await readLock();
+		if (lock?.pid && lock.pid !== process.pid && await processIsRunning(lock.pid)) {
+			throw new Error(`Telegram bridge is already connected in another pi process (pid ${lock.pid}). Stop that session or run /telegram-disconnect there first.`);
+		}
+		await writeLock();
 
 		try {
 			await callTelegram("deleteWebhook", { drop_pending_updates: false }, { signal });
@@ -960,7 +1037,8 @@ export default function (pi: ExtensionAPI) {
 	async function startPolling(ctx: ExtensionContext): Promise<void> {
 		if (!config.botToken || pollingPromise) return;
 		pollingController = new AbortController();
-		pollingPromise = pollLoop(ctx, pollingController.signal).finally(() => {
+		pollingPromise = pollLoop(ctx, pollingController.signal).finally(async () => {
+			await clearLock();
 			pollingPromise = undefined;
 			pollingController = undefined;
 			updateStatus(ctx);
@@ -1015,6 +1093,7 @@ export default function (pi: ExtensionAPI) {
 			const status = [
 				`bot: ${config.botUsername ? `@${config.botUsername}` : "not configured"}`,
 				`allowed user: ${config.allowedUserId ?? "not paired"}`,
+				`allowed chat: ${getNotifyChatId() ?? "not paired"}`,
 				`polling: ${pollingPromise ? "running" : "stopped"}`,
 				`active telegram turn: ${activeTelegramTurn ? "yes" : "no"}`,
 				`queued telegram turns: ${queuedTelegramTurns.length}`,
@@ -1033,6 +1112,14 @@ export default function (pi: ExtensionAPI) {
 			}
 			await startPolling(ctx);
 			updateStatus(ctx);
+			await sendConnectNotification(ctx).catch((error) => {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Telegram connect notification failed: ${message}`, "error");
+			});
+			void pollingPromise?.catch((error) => {
+				const message = error instanceof Error ? error.message : String(error);
+				ctx.ui.notify(`Telegram bridge connection failed: ${message}`, "error");
+			});
 		},
 	});
 
